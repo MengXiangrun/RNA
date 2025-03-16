@@ -131,7 +131,7 @@ class Transformer(torch.nn.Module, RNADataset):
 
         encoder_emb = source_emb.clone()
         for encoder_layer in self.encoder_layer_list:
-            encoder_emb = encoder_layer.forward(source_emb=source_emb,
+            encoder_emb = encoder_layer.forward(source_emb=encoder_emb,
                                                 source_pad_mask=source_pad_mask,
                                                 attention_mask=source_attention_mask,
                                                 is_casual=is_casual)
