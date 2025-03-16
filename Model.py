@@ -6,6 +6,7 @@ import os
 import torch_geometric
 import torch
 import math
+from Dataset import RNADataset
 
 
 class Linear(torch.nn.Module):
@@ -28,65 +29,11 @@ class Linear(torch.nn.Module):
 class MultiHeadAttention(torch.nn.Module):
     def __init__(self, emb_dim, num_head, dropout=0.0):
         super().__init__()
-        self.emb_dim = emb_dim
-        self.num_head = num_head
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.head_dim = self.emb_dim // self.num_head
-        assert self.head_dim * self.num_head == self.emb_dim
 
-        self.q_linear = Linear(self.emb_dim, self.emb_dim, bias=False)
-        self.k_linear = Linear(self.emb_dim, self.emb_dim, bias=False)
-        self.v_linear = Linear(self.emb_dim, self.emb_dim, bias=False)
-        self.out_linear = Linear(self.emb_dim, self.emb_dim, bias=True)
 
     def forward(self, source_emb, target_emb,
                 source_pad_mask=None, target_pad_mask=None, attention_mask=None, is_casual=False):
-        # batch first:
-        # source_emb (batch_size, num_source_token, token_dim)
-        # target_emb (batch_size, num_target_token, token_dim)
-        # sequence_length = num_token = num_source_token = num_target_token
 
-        # key_padding_mask
-        # (source sequence length)
-        # (batch size, source sequence length)
-
-        num_head = self.num_head
-        head_dim = self.head_dim
-
-        # (batch_size, num_target_token, token_dim)
-        # -> (batch_size, num_target_token, num_head, head_dim)
-        # -> (batch_size, num_head, num_target_token, head_dim)
-        # -> (batch_size * num_head, num_target_token, head_dim)
-        q_emb = target_emb.clone()
-        q_emb = self.q_linear(q_emb)
-        batch_size, num_target_token, emb_dim = q_emb.shape
-        q_emb = q_emb.view(batch_size, num_target_token, num_head, head_dim)
-        q_emb = q_emb.transpose(1, 2)
-        q_emb = q_emb.contiguous().view(batch_size * num_head, num_target_token, head_dim)
-
-        # (batch_size, num_source_token, token_dim)
-        # -> (batch_size, num_source_token, num_head, head_dim)
-        # -> (batch_size, num_head, num_source_token, head_dim)
-        # -> (batch_size * num_head, num_source_token, head_dim)
-        # -> (batch_size * num_head, head_dim, num_source_token)
-        k_emb = source_emb.clone()
-        k_emb = self.k_linear(k_emb)
-        batch_size, num_source_token, emb_dim = k_emb.shape
-        k_emb = k_emb.view(batch_size, num_source_token, num_head, head_dim)
-        k_emb = k_emb.transpose(1, 2)
-        k_emb = k_emb.contiguous().view(batch_size * num_head, num_source_token, head_dim)
-        k_emb_transpose = k_emb.transpose(-2, -1)
-
-        # (batch_size, num_source_token, token_dim)
-        # -> (batch_size, num_source_token, num_head, head_dim)
-        # -> (batch_size, num_head, num_source_token, head_dim)
-        # -> (batch_size * num_head, num_source_token, head_dim)
-        v_emb = source_emb.clone()
-        v_emb = self.v_linear(v_emb)
-        batch_size, num_source_token, emb_dim = v_emb.shape
-        v_emb = v_emb.view(batch_size, num_source_token, num_head, head_dim)
-        v_emb = v_emb.transpose(1, 2)
-        v_emb = v_emb.contiguous().view(batch_size * num_head, num_source_token, head_dim)
 
         # attention_mask
         # (batch_size * num_head, num_target_token, num_source_token)
@@ -99,30 +46,6 @@ class MultiHeadAttention(torch.nn.Module):
                                          is_casual=is_casual,
                                          num_head=num_head)
 
-        if attention_mask is not None:
-            q_emb = q_emb / math.sqrt(float(head_dim))  # scaling
-            attention = torch.baddbmm(attention_mask, q_emb, k_emb_transpose)
-        else:
-            q_emb = q_emb / math.sqrt(float(head_dim))  # scaling
-            attention = torch.bmm(q_emb, k_emb.transpose(-2, -1))
-
-        attention = torch.nn.functional.softmax(attention, dim=-1)
-        attention = self.dropout(input=attention)
-
-        # (batch_size * num_head, num_target_token, head_dim)
-        # -> (num_target_token, batch_size * num_head, head_dim)
-        # -> (num_target_token, batch_size, num_head, head_dim)
-        # -> (num_target_token, batch_size, emb_dim)
-        # -> (num_target_token, batch_size, emb_dim)
-        out_emb = torch.bmm(attention, v_emb)
-        out_emb = out_emb.transpose(dim0=0, dim1=1).contiguous()
-        out_emb = out_emb.view(num_target_token, batch_size, num_head, head_dim)
-        out_emb = out_emb.view(num_target_token, batch_size, emb_dim)
-        out_emb = self.out_linear(out_emb)
-
-        # (batch_size * num_head, num_target_token, num_source_token)
-        # -> (batch_size, num_head, num_target_token, num_source_token)
-        attention = attention.view(batch_size, num_head, num_target_token, num_source_token)
 
         return out_emb, attention
 
@@ -130,64 +53,87 @@ class MultiHeadAttention(torch.nn.Module):
                    num_source_token, source_pad_mask,
                    num_target_token, target_pad_mask,
                    attention_mask, batch_size, num_head, is_casual):
-        if source_pad_mask is None:
-            shape = (batch_size, num_source_token)
-            source_pad_mask = torch.ones(shape, device=self.out_linear.linear.weight.device, dtype=torch.float32)
 
-        if target_pad_mask is None:
-            shape = (batch_size, num_target_token)
-            target_pad_mask = torch.ones(shape, device=self.out_linear.linear.weight.device, dtype=torch.float32)
-
-        if attention_mask is None:
-            shape = (batch_size, num_target_token, num_source_token)
-            attention_mask = torch.ones(shape, device=self.out_linear.linear.weight.device, dtype=torch.float32)
-
-        # pad mask
-        batch_size_source_pad_mask, num_source_token = source_pad_mask.shape
-        batch_size_target_pad_mask, num_target_token = target_pad_mask.shape
-
-        # attention_mask
-        batch_size_attention_mask, num_target_token, num_source_token = attention_mask.shape
-
-        assert batch_size == batch_size_source_pad_mask
-        assert batch_size == batch_size_target_pad_mask
-        assert batch_size == batch_size_attention_mask
-
-        # target_pad_mask: (batch_size, num_target_token) -> (batch_size, num_target_token, 1)
-        # source_pad_mask: (batch_size, num_source_token) -> (batch_size, 1, num_source_token)
-        target_pad_mask = target_pad_mask.view(batch_size, num_target_token, 1)
-        source_pad_mask = source_pad_mask.view(batch_size, 1, num_source_token)
-
-        # pad_mask
-        # (batch_size, num_target_token, num_source_token)
-        # -> (batch_size, num_head, num_target_token, num_source_token)
-        # -> (batch_size * num_head, num_target_token, num_source_token)
-        pad_mask = torch.bmm(target_pad_mask, source_pad_mask)
-        pad_mask = pad_mask.view(batch_size, 1, num_target_token, num_source_token)
-        pad_mask = pad_mask.expand(batch_size, num_head, num_target_token, num_source_token)
-        pad_mask = pad_mask.reshape(batch_size * num_head, num_target_token, num_source_token)
-        pad_mask = pad_mask.float()
-
-        # attention_mask
-        # (batch_size, num_target_token, num_source_token)
-        # -> (batch_size, num_head, num_target_token, num_source_token)
-        # -> (batch_size * num_head, num_target_token, num_source_token)
-        attention_mask = attention_mask.view(batch_size, 1, num_target_token, num_source_token)
-        attention_mask = attention_mask.expand(batch_size, num_head, num_target_token, num_source_token)
-        attention_mask = attention_mask.reshape(batch_size * num_head, num_target_token, num_source_token)
-
-        # both are the same shape
-        attention_mask = pad_mask * attention_mask
-
-        # is_casual
-        if is_casual:
-            causal_mask = torch.ones((num_target_token, num_source_token))
-            causal_mask = torch.tril(causal_mask)
-            causal_mask = causal_mask.view(1, 1, num_target_token, num_source_token)
-            causal_mask = causal_mask.expand(batch_size, num_head, num_target_token, num_source_token)
-            causal_mask = causal_mask.reshape(batch_size * num_head, num_target_token, num_source_token)
-
-            # both are the same shape
-            attention_mask = causal_mask * attention_mask
 
         return attention_mask
+
+
+class FeedForwardNetwork(torch.nn.Module):
+    def __init__(self, in_dim=-1, hidden_dim=2048, out_dim=-1, bias=True, dropout=0.1):
+
+
+    def forward(self, emb):
+
+
+        return out_emb
+
+
+class EncoderLayer(torch.nn.Module):
+    def __init__(self,
+                 emb_dim: int,
+                 num_head: int,
+                 ffn_dim: int = 2048,
+                 dropout: float = 0.1,
+                 eps: float = 1e-5):
+        super().__init__()
+
+
+    def forward(self, source_emb, source_pad_mask, attention_mask, is_casual):
+
+
+        return ffn_emb
+
+
+class Transformer(torch.nn.Module, RNADataset):
+    def __init__(self,
+                 num_token_type,
+                 emb_dim=512,
+                 num_head=8,
+                 num_encoder_layers=6,
+                 ffn_dim=2048,
+                 dropout=0.1,
+                 eps=1e-5):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.num_head = num_head
+        self.num_encoder_layers = num_encoder_layers
+        self.ffn_dim = ffn_dim
+        self.dropout = dropout
+        self.eps = eps
+
+        self.token2emb = torch.nn.Embedding(num_embeddings=num_token_type, embedding_dim=emb_dim)
+
+        self.encoder_layer_list = torch.nn.ModuleList()
+        for layer_index in range(self.num_encoder_layers):
+            encoder_layer = EncoderLayer(emb_dim=emb_dim,
+                                         num_head=num_head,
+                                         ffn_dim=ffn_dim,
+                                         dropout=dropout,
+                                         eps=eps)
+            self.encoder_layer_list.append(encoder_layer)
+
+    def forward(self,
+                source_token,
+                target_token=None,
+                source_emb=None,
+                target_emb=None,
+                source_pad_mask=None,
+                target_pad_mask=None,
+                source_attention_mask=None,
+                target_attention_mask=None,
+                is_casual=False):
+        # batch first:
+        # source_emb (num_batch, num_token, emb_dim)
+        # target_emb (num_batch, num_token, emb_dim)
+        # sequence_length = num_token
+
+        source_emb = self.token2emb.forward(input=source_token)
+
+        encoder_emb = source_emb.clone()
+        for encoder_layer in self.encoder_layer_list:
+            encoder_emb = encoder_layer.forward(source_emb=source_emb,
+                                                source_pad_mask=source_pad_mask,
+                                                attention_mask=source_attention_mask,
+                                                is_casual=is_casual)
+
+        return encoder_emb
