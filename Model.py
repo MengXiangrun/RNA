@@ -39,7 +39,8 @@ class MultiHeadAttention(torch.nn.Module):
         self.v_linear = Linear(self.emb_dim, self.emb_dim, bias=False)
         self.out_linear = Linear(self.emb_dim, self.emb_dim, bias=True)
 
-    def forward(self, source_emb, target_emb, pad_mask=None, attention_mask=None):
+    def forward(self, source_emb, target_emb,
+                source_pad_mask=None, target_pad_mask=None, attention_mask=None, is_casual=False):
         # batch first:
         # source_emb (batch_size, num_source_token, token_dim)
         # target_emb (batch_size, num_target_token, token_dim)
@@ -89,6 +90,15 @@ class MultiHeadAttention(torch.nn.Module):
 
         # attention_mask
         # (batch_size * num_head, num_target_token, num_source_token)
+        attention_mask = self.merge_mask(num_source_token=num_source_token,
+                                         source_pad_mask=source_pad_mask,
+                                         num_target_token=num_target_token,
+                                         target_pad_mask=target_pad_mask,
+                                         attention_mask=attention_mask,
+                                         batch_size=batch_size,
+                                         is_casual=is_casual,
+                                         num_head=num_head)
+
         if attention_mask is not None:
             q_emb = q_emb / math.sqrt(float(head_dim))  # scaling
             attention = torch.baddbmm(attention_mask, q_emb, k_emb_transpose)
@@ -116,28 +126,68 @@ class MultiHeadAttention(torch.nn.Module):
 
         return out_emb, attention
 
-    def get_mask(self,
-                 batch_size,
-                 num_head,
-                 num_source_token,
-                 num_target_token):
-        # Padding Mask (batch_size, num_source_token)
-        padding_mask = torch.zeros(batch_size, num_source_token)  # 示例数据
+    def merge_mask(self,
+                   num_source_token, source_pad_mask,
+                   num_target_token, target_pad_mask,
+                   attention_mask, batch_size, num_head, is_casual):
+        if source_pad_mask is None:
+            shape = (batch_size, num_source_token)
+            source_pad_mask = torch.ones(shape, device=self.out_linear.linear.weight.device, dtype=torch.float32)
 
-        # Causal Mask (num_target_token, num_target_token)
-        causal_mask = torch.tril(torch.ones(num_target_token, num_target_token))  # 示例数据
+        if target_pad_mask is None:
+            shape = (batch_size, num_target_token)
+            target_pad_mask = torch.ones(shape, device=self.out_linear.linear.weight.device, dtype=torch.float32)
 
-        # 扩展 Padding Mask 到 (batch_size, 1, 1, num_source_token)
-        padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
+        if attention_mask is None:
+            shape = (batch_size, num_target_token, num_source_token)
+            attention_mask = torch.ones(shape, device=self.out_linear.linear.weight.device, dtype=torch.float32)
 
-        # 扩展 Causal Mask 到 (1, 1, num_target_token, num_target_token)
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+        # pad mask
+        batch_size_source_pad_mask, num_source_token = source_pad_mask.shape
+        batch_size_target_pad_mask, num_target_token = target_pad_mask.shape
 
-        # 合并掩码 (batch_size, 1, num_target_token, num_source_token)
-        attention_mask = padding_mask + causal_mask
+        # attention_mask
+        batch_size_attention_mask, num_target_token, num_source_token = attention_mask.shape
 
-        # 扩展到 (batch_size * num_head, num_target_token, num_source_token)
-        attention_mask = attention_mask.expand(-1, num_head, -1, -1)
+        assert batch_size == batch_size_source_pad_mask
+        assert batch_size == batch_size_target_pad_mask
+        assert batch_size == batch_size_attention_mask
+
+        # target_pad_mask: (batch_size, num_target_token) -> (batch_size, num_target_token, 1)
+        # source_pad_mask: (batch_size, num_source_token) -> (batch_size, 1, num_source_token)
+        target_pad_mask = target_pad_mask.view(batch_size, num_target_token, 1)
+        source_pad_mask = source_pad_mask.view(batch_size, 1, num_source_token)
+
+        # pad_mask
+        # (batch_size, num_target_token, num_source_token)
+        # -> (batch_size, num_head, num_target_token, num_source_token)
+        # -> (batch_size * num_head, num_target_token, num_source_token)
+        pad_mask = torch.bmm(target_pad_mask, source_pad_mask)
+        pad_mask = pad_mask.view(batch_size, 1, num_target_token, num_source_token)
+        pad_mask = pad_mask.expand(batch_size, num_head, num_target_token, num_source_token)
+        pad_mask = pad_mask.reshape(batch_size * num_head, num_target_token, num_source_token)
+        pad_mask = pad_mask.float()
+
+        # attention_mask
+        # (batch_size, num_target_token, num_source_token)
+        # -> (batch_size, num_head, num_target_token, num_source_token)
+        # -> (batch_size * num_head, num_target_token, num_source_token)
+        attention_mask = attention_mask.view(batch_size, 1, num_target_token, num_source_token)
+        attention_mask = attention_mask.expand(batch_size, num_head, num_target_token, num_source_token)
         attention_mask = attention_mask.reshape(batch_size * num_head, num_target_token, num_source_token)
+
+        # both are the same shape
+        attention_mask = pad_mask * attention_mask
+
+        # is_casual
+        if is_casual:
+            causal_mask = torch.ones((num_target_token, num_source_token))
+            causal_mask = torch.tril(causal_mask)
+            causal_mask = causal_mask.view(1, 1, num_target_token, num_source_token)
+            causal_mask = causal_mask.expand(batch_size, num_head, num_target_token, num_source_token)
+            causal_mask = causal_mask.reshape(batch_size * num_head, num_target_token, num_source_token)
+
+            # both are the same shape
+            attention_mask = causal_mask * attention_mask
 
         return attention_mask
