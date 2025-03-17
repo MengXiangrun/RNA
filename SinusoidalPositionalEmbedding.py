@@ -64,3 +64,27 @@ sin = SinusoidalPositionalEmbedding(max_num_token=10, emb_dim=6, base=10000)
 toy_token_sequence = torch.tensor([[0, 5, 4, 3, 2]])
 toy_token_sequence_pe = sin.forward(token_sequence=toy_token_sequence)
 print(sin.position_emb)
+
+# Example usage (remains largely the same)
+token_ids = torch.tensor([
+    [1, 2, 3, 0, 0],
+    [4, 5, 0, 0, 0],
+    [6, 7, 8, 9, 0]
+])
+padding_mask = torch.tensor([
+    [1.0, 1.0, 1.0, 0.0, 0.0],
+    [1.0, 1.0, 0.0, 0.0, 0.0],
+    [1.0, 1.0, 1.0, 1.0, 0.0]
+])
+emb_dim = 8
+max_positions = 100
+
+pos_emb = SinusoidalPositionalEmbedding(emb_dim=emb_dim, max_num_token=max_positions)
+pos_embeddings = pos_emb(token_sequence=token_ids, pad_mask=padding_mask)
+print("token_ids:")
+print(token_ids)
+print("\npadding_mask:")
+print(padding_mask)
+print("\npos_embeddings:")
+print(pos_embeddings)
+
